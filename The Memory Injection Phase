@@ -1,0 +1,57 @@
+ def inflate_test(self, test: GetTest):
+        # Assuming test_type was loaded and placed in the context
+        test_type = self.entity_types[test.type] # Or self.test_types if you separate them
+        
+        self.inflate_scheme(test_type.scheme)
+        test.test_type = test_type
+        self.inflate_values(test.values, test_type.scheme)
+
+    def inflate_scheme(self, fields: list[dict]):
+        for field in fields:
+            if field["type"] == 'file' and field.get("default") is not None:
+                field["default"] = self.files.get(field["default"])
+            
+            elif field["type"] == 'entity':
+                if field.get("default") is not None:
+                    ent = self.entities.get(field["default"])
+                    self.inflate_entity(ent) # Recursively inject memory
+                    field["default"] = ent
+                    
+                et = self.entity_types.get(field["entity_type"])
+                self.inflate_scheme(et.scheme)
+                field["entity_type"] = et
+                
+            elif field["type"] == 'sub-entity':
+                if field.get("default") is not None:
+                    self.inflate_values(field["default"], field["scheme"])
+                self.inflate_scheme(field["scheme"])
+
+    def inflate_values(self, values: dict, fields: list[dict]):
+        field_map = {f["key"]: f for f in fields}
+        
+        for val_key, val in values.items():
+            if val is None or val_key not in field_map:
+                continue
+                
+            field = field_map[val_key]
+            
+            if field["type"] == 'file':
+                values[val_key] = self.files.get(val)
+            elif field["type"] == 'entity':
+                ent = self.entities.get(val)
+                self.inflate_entity(ent)
+                values[val_key] = ent
+            elif field["type"] == 'sub-entity':
+                self.inflate_values(val, field["scheme"])
+
+    def inflate_entity(self, e: GetEntity):
+        # Prevent infinite recursion if entities reference each other
+        if getattr(e, "_is_inflated", False): 
+            return
+            
+        et = self.entity_types.get(e.type)
+        self.inflate_scheme(et.scheme)
+        e.entity_type = et
+        self.inflate_values(e.values, et.scheme)
+        
+        e._is_inflated = True
