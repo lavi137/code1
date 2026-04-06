@@ -1,0 +1,66 @@
+from sqlmodel import select 
+# or sqlalchemy select, depending on your exact import
+
+class InflationContext:
+    def __init__(self, session):
+        self.session = session
+        
+        # In-Memory Caches (ID -> GET Model)
+        self.files = {}
+        self.entity_types = {}
+        self.entities = {}
+        
+        # Queues for Batch Fetching
+        self.pending_files = set()
+        self.pending_entity_types = set()
+        self.pending_entities = set()
+        
+        # Entities we fetched, but couldn't scan their `values` yet 
+        # because we were waiting for their EntityType schema to load
+        self.unscanned_entities = []
+
+    # --- QUEUEING METHODS ---
+    def request_file(self, file_id):
+        if file_id and file_id not in self.files:
+            self.pending_files.add(file_id)
+
+    def request_entity_type(self, et_id):
+        if et_id and et_id not in self.entity_types:
+            self.pending_entity_types.add(et_id)
+
+    def request_entity(self, e_id):
+        if e_id and e_id not in self.entities:
+            self.pending_entities.add(e_id)
+
+    # --- DISCOVERY METHODS ---
+    def scan_scheme(self, fields: list[dict]):
+        for field in fields:
+            if field["type"] == 'file' and field.get("default") is not None:
+                self.request_file(field["default"])
+            
+            elif field["type"] == 'entity':
+                if field.get("default") is not None:
+                    self.request_entity(field["default"])
+                self.request_entity_type(field["entity_type"])
+                
+            elif field["type"] == 'sub-entity':
+                self.scan_scheme(field["scheme"])
+                if field.get("default") is not None:
+                    self.scan_values(field["default"], field["scheme"])
+
+    def scan_values(self, values: dict, fields: list[dict]):
+        # Bonus Optimization: Convert fields to a dict for O(1) lookups
+        field_map = {f["key"]: f for f in fields}
+        
+        for val_key, val in values.items():
+            if val is None or val_key not in field_map:
+                continue
+                
+            field = field_map[val_key]
+            
+            if field["type"] == 'file':
+                self.request_file(val)
+            elif field["type"] == 'entity':
+                self.request_entity(val)
+            elif field["type"] == 'sub-entity':
+                self.scan_values(val, field["scheme"])
