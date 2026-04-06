@@ -1,0 +1,14 @@
+def process_test(session, test: GetTest):
+    ctx = InflationContext(session)
+    
+    # 1. Seed the context with the Test's immediate requirements
+    # (assuming test object has a type/schema)
+    # ctx.scan_values(test.values, test.scheme) 
+    
+    # 2. Fire the batch loader
+    ctx.load_all()
+    
+    # 3. Inject the cached objects into the dictionaries
+    ctx.inflate_test(test)
+    
+    return test
