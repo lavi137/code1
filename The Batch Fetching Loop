@@ -1,0 +1,58 @@
+def load_all(self):
+        while True:
+            # 1. Fetch pending Entity Types
+            if self.pending_entity_types:
+                ids = list(self.pending_entity_types)
+                self.pending_entity_types.clear()
+                
+                # Batch query!
+                db_ets = self.session.execute(
+                    select(EntityType).where(EntityType.id.in_(ids))
+                ).scalars().all()
+                
+                for et in db_ets:
+                    get_et = convert_entity_type_to_get(et)
+                    self.entity_types[et.id] = get_et
+                    self.scan_scheme(get_et.scheme) # May discover new Files/Entities
+
+            # 2. Fetch pending Entities
+            if self.pending_entities:
+                ids = list(self.pending_entities)
+                self.pending_entities.clear()
+                
+                db_ents = self.session.execute(
+                    select(Entity).where(Entity.id.in_(ids))
+                ).scalars().all()
+                
+                for e in db_ents:
+                    get_e = convert_entity_to_get(e)
+                    self.entities[e.id] = get_e
+                    self.unscanned_entities.append(get_e)
+                    self.request_entity_type(get_e.type) # We need its schema to read its values
+
+            # 3. Attempt to scan Entities now that we might have their schemas
+            still_unscanned = []
+            for e in self.unscanned_entities:
+                if e.type in self.entity_types:
+                    schema = self.entity_types[e.type].scheme
+                    self.scan_values(e.values, schema)
+                else:
+                    still_unscanned.append(e) # Wait for the next loop
+            self.unscanned_entities = still_unscanned
+
+            # 4. Fetch pending Files
+            if self.pending_files:
+                ids = list(self.pending_files)
+                self.pending_files.clear()
+                
+                db_files = self.session.execute(
+                    select(File).where(File.id.in_(ids))
+                ).scalars().all()
+                
+                for f in db_files:
+                    self.files[f.id] = convert_file_to_get(f)
+
+            # Break loop when all queues are empty
+            if not (self.pending_entity_types or self.pending_entities or 
+                    self.pending_files or self.unscanned_entities):
+                break
