@@ -1,0 +1,201 @@
+from sqlmodel import select
+
+class TestInflater:
+    def __init__(self, session):
+        self.session = session
+        
+        # Memory Caches
+        self.entities = {}
+        self.entity_types = {}
+        self.files = {}
+        
+        # ID Queues
+        self.entity_ids = set()
+        self.entity_type_ids = set()
+        self.file_ids = set()
+
+    def process(self, test: GetTest):
+        """The main entry point that executes the 3-step pipeline."""
+        # STEP 1: Discover & Fetch Entities
+        self._queue_test_deps(test)
+        self._fetch_entities()
+        
+        # STEP 2: Discover & Fetch Files (from Tests, Entities, and Sub-entities)
+        self._queue_file_deps(test)
+        self._fetch_files()
+        
+        # STEP 3: Inject Everything in Memory
+        self._inject_test(test)
+        return test
+
+    # --- STEP 1: ENTITY DISCOVERY & FETCHING ---
+
+    def _queue_test_deps(self, test: GetTest):
+        # 1. Scan Test Type Scheme for Entity/File defaults and Entity Types
+        for field in test.test_type.scheme:
+            if field["type"] == "entity":
+                if field.get("default") is not None:
+                    self.entity_ids.add(field["default"])
+                self.entity_type_ids.add(field["entity_type"])
+            elif field["type"] == "file" and field.get("default") is not None:
+                self.file_ids.add(field["default"])
+
+        # 2. Scan Test Values for Entity/File values
+        field_map = {f["key"]: f for f in test.test_type.scheme}
+        for val_key, val in test.values.items():
+            if val is None or val_key not in field_map:
+                continue
+            
+            field = field_map[val_key]
+            if field["type"] == "entity":
+                self.entity_ids.add(val)
+            elif field["type"] == "file":
+                self.file_ids.add(val)
+
+    def _fetch_entities(self):
+        if self.entity_type_ids:
+            ets = self.session.execute(
+                select(EntityType).where(EntityType.id.in_(list(self.entity_type_ids)))
+            ).scalars().all()
+            self.entity_types = {et.id: convert_entity_type_to_get(et) for et in ets}
+
+        if self.entity_ids:
+            ents = self.session.execute(
+                select(Entity).where(Entity.id.in_(list(self.entity_ids)))
+            ).scalars().all()
+            self.entities = {e.id: convert_entity_to_get(e) for e in ents}
+
+    # --- STEP 2: FILE DISCOVERY & FETCHING ---
+
+    def _queue_file_deps(self, test: GetTest):
+        # We already queued Test-level files in Step 1.
+        # Now we queue files inside the newly fetched Entities and their schemas.
+        
+        for et in self.entity_types.values():
+            for field in et.scheme:
+                if field["type"] == "file" and field.get("default") is not None:
+                    self.file_ids.add(field["default"])
+                elif field["type"] == "sub-entity":
+                    self._queue_sub_entity_scheme_files(field["scheme"])
+                    if field.get("default") is not None:
+                        self._queue_sub_entity_value_files(field["default"], field["scheme"])
+
+        for ent in self.entities.values():
+            # If we fetched an entity, we also need to ensure its EntityType is loaded
+            # (In case it wasn't explicitly linked in the Test Type schema)
+            if ent.type not in self.entity_types:
+                et = self.session.get(EntityType, ent.type) # Fallback, rarely hit
+                self.entity_types[ent.type] = convert_entity_type_to_get(et)
+            
+            et_scheme = self.entity_types[ent.type].scheme
+            field_map = {f["key"]: f for f in et_scheme}
+            
+            for val_key, val in ent.values.items():
+                if val is None or val_key not in field_map:
+                    continue
+                
+                field = field_map[val_key]
+                if field["type"] == "file":
+                    self.file_ids.add(val)
+                elif field["type"] == "sub-entity":
+                    self._queue_sub_entity_value_files(val, field["scheme"])
+
+    def _queue_sub_entity_scheme_files(self, scheme: list[dict]):
+        for field in scheme:
+            if field["type"] == "file" and field.get("default") is not None:
+                self.file_ids.add(field["default"])
+
+    def _queue_sub_entity_value_files(self, values: dict, scheme: list[dict]):
+        field_map = {f["key"]: f for f in scheme}
+        for val_key, val in values.items():
+            if val is None or val_key not in field_map:
+                continue
+            if field_map[val_key]["type"] == "file":
+                self.file_ids.add(val)
+
+    def _fetch_files(self):
+        if self.file_ids:
+            files = self.session.execute(
+                select(File).where(File.id.in_(list(self.file_ids)))
+            ).scalars().all()
+            self.files = {f.id: convert_file_to_get(f) for f in files}
+
+    # --- STEP 3: MEMORY INJECTION ---
+    # (This behaves exactly like your original logic, but reads from self.dictionaries)
+
+    def _inject_test(self, test: GetTest):
+        # 1. Inflate Test Type Scheme
+        for field in test.test_type.scheme:
+            if field["type"] == "file" and field.get("default") is not None:
+                field["default"] = self.files.get(field["default"])
+            elif field["type"] == "entity":
+                if field.get("default") is not None:
+                    ent = self.entities.get(field["default"])
+                    self._inject_entity(ent)
+                    field["default"] = ent
+                
+                et = self.entity_types.get(field["entity_type"])
+                self._inject_entity_type(et)
+                field["entity_type"] = et
+
+        # 2. Inflate Test Values
+        field_map = {f["key"]: f for f in test.test_type.scheme}
+        for val_key, val in test.values.items():
+            if val is None or val_key not in field_map:
+                continue
+            
+            field = field_map[val_key]
+            if field["type"] == "file":
+                test.values[val_key] = self.files.get(val)
+            elif field["type"] == "entity":
+                ent = self.entities.get(val)
+                self._inject_entity(ent)
+                test.values[val_key] = ent
+
+    def _inject_entity_type(self, et: GetEntityType):
+        if getattr(et, "_is_inflated", False):
+            return
+        
+        for field in et.scheme:
+            if field["type"] == "file" and field.get("default") is not None:
+                field["default"] = self.files.get(field["default"])
+            elif field["type"] == "sub-entity":
+                self._inject_sub_entity_scheme(field["scheme"])
+                if field.get("default") is not None:
+                    self._inject_sub_entity_values(field["default"], field["scheme"])
+                    
+        et._is_inflated = True
+
+    def _inject_entity(self, ent: GetEntity):
+        if not ent or getattr(ent, "_is_inflated", False):
+            return
+            
+        et = self.entity_types.get(ent.type)
+        self._inject_entity_type(et)
+        ent.entity_type = et
+        
+        field_map = {f["key"]: f for f in et.scheme}
+        for val_key, val in ent.values.items():
+            if val is None or val_key not in field_map:
+                continue
+                
+            field = field_map[val_key]
+            if field["type"] == "file":
+                ent.values[val_key] = self.files.get(val)
+            elif field["type"] == "sub-entity":
+                self._inject_sub_entity_values(val, field["scheme"])
+                
+        ent._is_inflated = True
+
+    def _inject_sub_entity_scheme(self, scheme: list[dict]):
+        for field in scheme:
+            if field["type"] == "file" and field.get("default") is not None:
+                field["default"] = self.files.get(field["default"])
+
+    def _inject_sub_entity_values(self, values: dict, scheme: list[dict]):
+        field_map = {f["key"]: f for f in scheme}
+        for val_key, val in values.items():
+            if val is None or val_key not in field_map:
+                continue
+            if field_map[val_key]["type"] == "file":
+                values[val_key] = self.files.get(val)
